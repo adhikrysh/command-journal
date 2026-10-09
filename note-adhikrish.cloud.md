@@ -1,12 +1,8 @@
 # command-journal
 
-the most dangerous moment in commanding a spacecraft is very short. it starts when a command leaves the ground system and ends when someone writes down that it left.
+the dangerous window in commanding a spacecraft is short: after the command goes out, before the ground writes down that it went. crash there and on restart nobody knows whether the payload acted. resend and maybe it fires twice. don't, and maybe it never fires.
 
-crash inside that gap and you wake up not knowing what happened. did the payload act? if you send the command again, maybe it acts twice. if you do not, maybe it never acts at all. "fire the thruster for ten seconds" is not a command you want to run zero times or two times.
-
-this is the oldest problem in distributed systems wearing a flight suit: two parties, two memories, and a crash at the worst possible instant. command-journal is a small experiment in surviving it, with the ordering of every write and every sync chosen on purpose.
-
-## what it does
+command-journal is a crash-recovery experiment for that window, with every write and every `fsync` ordered on purpose.
 
 command-journal models a ground-side command executor that dies between sending a command and recording its result. the simulated payload is a register from 0 to 1023.
 
@@ -74,5 +70,3 @@ the crash exits 75. before recovery, the host is at sequence 1 while the payload
 this provides exactly-once *recovery* only because the simulated payload durably remembers command ids and command contents. it does not establish exactly-once control for a physical actuator that can lose that memory, act after power loss without recording the result, or have its own write cache report durability incorrectly. the tests exercise process death, not sudden power removal or failed storage hardware. compaction is absent, so the 64 mib journals bound this experiment and do not suit a long-running flight system.
 
 the [executor api](include/journal/executor.hpp), [record format](docs/format.md), and [tests](tests/test_journal.cpp) describe the implementation at this project revision. JPL's [F Prime command sequencer](https://fprime.jpl.nasa.gov/v4.3.0/Svc/CmdSequencer/docs/sdd/) covers command validation and sequencing; this project implements a separate persistence experiment.
-
-the takeaway fits on a sticky note: write down what you are about to do, make sure it reached disk, and never trust anything that only lived in memory when the lights went out.
