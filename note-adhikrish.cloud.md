@@ -1,72 +1,32 @@
 # command-journal
 
-the dangerous window in commanding a spacecraft is short: after the command goes out, before the ground writes down that it went. crash there and on restart nobody knows whether the payload acted. resend and maybe it fires twice. don't, and maybe it never fires.
+the scariest moment in commanding a spacecraft is right after the command goes out and right before you write down that it went. crash there and on restart nobody knows if the payload acted. resend and maybe the thruster fires twice. don't, and maybe it never fires. both are bad days.
 
-command-journal is a crash-recovery experiment for that window, with every write and every `fsync` ordered on purpose.
+this is a little crash-recovery experiment for that gap. the "thruster" is a simulated register from 0 to 1023, and commands are compare-and-set, so a command only applies if the payload is in the state it expects.
 
-command-journal models a ground-side command executor that dies between sending a command and recording its result. the simulated payload is a register from 0 to 1023.
+## ordering
 
-a command is a compare-and-set operation. it has a sequence number, the sequence and value it expects to find, and the value it wants to write. the payload checks those preconditions before applying a command.
-
-## the durable boundary
-
-the host first appends an **accepted** record to its own journal and calls `fsync`. only then may it dispatch the command to the payload. the payload checks the same precondition, appends the exact command to its own durable log, syncs it, and only then acknowledges it. after the acknowledgement, the host appends and syncs a **completed** record.
+the host writes **accepted** to its journal and `fsync`s before sending anything. the payload checks the precondition, writes the command to its own log, syncs, then acks. the host then writes **completed**.
 
 ```text
-host              payload
- | accept + sync     |
- v                   |
-commands log         |
- | dispatch -------->|
- |                   v
- |              apply + sync
- |<------ durable ack|
- v
-complete + sync
+host: accept + sync -> dispatch -> payload: apply + sync -> ack -> host: complete + sync
 ```
 
-that ordering records the host's accepted command before the payload can change state. recovery has at most one pending command, and the payload may be at most one durable command ahead.
+so at recovery there's at most one command in doubt, and the payload is at most one step ahead. in the lost-ack case (payload applied 42 -> 84, then the process died), recovery replays both logs, sees the payload already has that exact command, writes the missing completion, and doesn't resend. if the payload never got it, recovery checks the preconditions before applying, and a reused sequence number with different contents is an error, which keeps stale commands and split-brain out.
 
-in the lost-acknowledgement case, command 2 changes the register from 42 to 84, the payload syncs it, and the process exits before the host records completion. on restart, both histories are replayed before either file changes. the payload already stores the same sequence and command body, so recovery writes the missing host completion without sending command 2 again.
+## the journal
 
-if the payload has not stored the accepted command, recovery checks the expected sequence and value before applying it. a failed check stops recovery. reusing a sequence number with different command content is also an error. these rules reject old commands and split-brain histories.
+frames have a magic, a version, a bounded length and a crc32c, and replay checks the state transitions too, not just the bytes. a half-written tail gets truncated, but a complete frame with a bad checksum is rejected outright, and it never skips ahead looking for the next good frame, because skipping garbage can also skip a real command. both logs get verified before either is repaired, since fixing one first can destroy the evidence of what the payload did. any i/o error poisons the executor until you reopen it.
 
-## validating the journal
+## tests
 
-each frame has a magic and version, bounded length, typed payload, and crc32c checksum. accepted frames carry the full command; completion frames carry the sequence they close. replay checks state transitions as well as bytes: sequence order, expected state, one pending command, and matching completion.
-
-the scanner distinguishes an incomplete final tail from corruption. after both journals validate, a writable open truncates only the incomplete tail and syncs the repaired files and directory. a read-only open only reports it. a complete frame with a bad checksum, length, kind, or transition is rejected. the scanner never searches for a later magic marker, because skipping damaged bytes could also skip a real command.
-
-recovery verifies **both** logs before repair. truncating one log first could remove the evidence needed to decide whether the payload already acted. after an I/O failure, the executor becomes poisoned and rejects further calls. close it, reopen it, replay the durable histories, and recover from what reached disk.
-
-## file access
-
-the executor takes a non-blocking exclusive write lock and a shared inspection lock. it opens logs with `O_NOFOLLOW`, requires regular files, retries interrupted I/O, and caps each journal at 64 mib. these checks prevent competing writers, symlink redirects, shortened I/O, and unbounded replay memory.
-
-the payload log records an effect; the host log records intent and completion. recovery does not infer either one from a transient acknowledgement or process memory.
-
-## verification
-
-the test executable has five checks. it verifies the crc32c known-answer value, every prefix of a two-frame stream, and 464 one-bit corruptions. it rejects malformed transitions and symlinked logs, checks stale preconditions and the single-writer lock, and proves that an executor poisoned by an I/O-boundary failure must be reopened.
-
-the central recovery test starts fresh processes and deliberately exits at all nine write and sync boundaries: acceptance, payload application, and host completion. it runs recovery twice and confirms that the final history is stable and the payload application count does not increase on the second pass.
-
-requires C++20, CMake 3.20+, and a POSIX system. you can reproduce the lost-acknowledgement case:
+the main test spawns real processes and kills them at all nine write and sync points, runs recovery twice, and checks the payload's apply count doesn't move the second time. there's also 464 single-bit corruptions, every prefix of a stream, symlinked logs and a single-writer lock.
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel 3
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ctest --test-dir build --output-on-failure
-
-journal_demo_dir=$(mktemp -d)
-./build/command-journal set "$journal_demo_dir" 0 42
-./build/command-journal set "$journal_demo_dir" 42 84 --crash payload_sync || test "$?" -eq 75
-./build/command-journal status "$journal_demo_dir"
-./build/command-journal recover "$journal_demo_dir"
+d=$(mktemp -d); ./build/command-journal set "$d" 0 42
+./build/command-journal set "$d" 42 84 --crash payload_sync; ./build/command-journal recover "$d"
 ```
 
-the crash exits 75. before recovery, the host is at sequence 1 while the payload is at sequence 2; after recovery, both are at sequence 2 with value 84 and two payload applications total.
-
-this provides exactly-once *recovery* only because the simulated payload durably remembers command ids and command contents. it does not establish exactly-once control for a physical actuator that can lose that memory, act after power loss without recording the result, or have its own write cache report durability incorrectly. the tests exercise process death, not sudden power removal or failed storage hardware. compaction is absent, so the 64 mib journals bound this experiment and do not suit a long-running flight system.
-
-the [executor api](include/journal/executor.hpp), [record format](docs/format.md), and [tests](tests/test_journal.cpp) describe the implementation at this project revision. JPL's [F Prime command sequencer](https://fprime.jpl.nasa.gov/v4.3.0/Svc/CmdSequencer/docs/sdd/) covers command validation and sequencing; this project implements a separate persistence experiment.
+this only gets exactly-once recovery because the fake payload remembers what it did. a real actuator that forgets, or a disk cache that lies about syncing, is a different problem. the tests kill processes, they don't pull the power. no compaction either, so the 64 MiB journal cap means this isn't flying anywhere long.
